@@ -1,0 +1,216 @@
+// Prisma schema para App Reservas
+// Generado en el Paso 1 (diseño del modelo de datos).
+//
+// NOTA (a confirmar en el Paso 3, cuando instalemos Prisma de verdad):
+// A fecha de esta revisión (sept. 2026) la versión estable más reciente es
+// Prisma ORM 7, que cambia el generator recomendado de "prisma-client-js" a
+// "prisma-client" (motor sin Rust) y añade un archivo prisma.config.ts para
+// la configuración. Este schema usa todavía "prisma-client-js" porque es lo
+// que instala `create-next-app`/`pnpm add prisma` hoy salvo que se pida lo
+// contrario; lo revisaremos contra la documentación oficial de Prisma 7 en
+// el Paso 3 antes de instalar nada, y ajustaremos el generator si procede.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+/// Configuración global del negocio. Se espera una única fila.
+model Business {
+  id   String @id @default(cuid())
+  name String
+
+  /// Zona horaria IANA del negocio (ej. "Europe/Madrid"). Todo el horario
+  /// semanal recurrente se define en esta zona; las reservas se guardan
+  /// siempre en UTC (ver Booking.startAt/endAt).
+  timezone String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Stylist {
+  id     String  @id @default(cuid())
+  name   String
+  email  String  @unique
+  phone  String?
+  active Boolean @default(true)
+
+  services               StylistService[]
+  weeklyAvailability     WeeklyAvailability[]
+  availabilityExceptions AvailabilityException[]
+  bookings               Booking[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Service {
+  id              String  @id @default(cuid())
+  name            String
+  description     String?
+  durationMinutes Int
+
+  /// Precio en céntimos (no decimal) para evitar errores de redondeo con
+  /// dinero. Ej. 25,50 € se guarda como 2550.
+  priceCents Int
+
+  active Boolean @default(true)
+
+  stylists StylistService[]
+  bookings Booking[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+/// Qué servicios sabe realizar cada estilista (muchos-a-muchos).
+model StylistService {
+  stylistId String
+  serviceId String
+
+  stylist Stylist @relation(fields: [stylistId], references: [id], onDelete: Cascade)
+  service Service @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  @@id([stylistId, serviceId])
+}
+
+enum DayOfWeek {
+  MONDAY
+  TUESDAY
+  WEDNESDAY
+  THURSDAY
+  FRIDAY
+  SATURDAY
+  SUNDAY
+}
+
+/// Horario semanal recurrente de un estilista, expresado en la hora local
+/// de Business.timezone (no en UTC).
+model WeeklyAvailability {
+  id        String    @id @default(cuid())
+  stylistId String
+  dayOfWeek DayOfWeek
+
+  /// Hora local de inicio, formato "HH:mm" (ej. "09:00").
+  startTime String
+  /// Hora local de fin, formato "HH:mm" (ej. "17:00").
+  endTime   String
+
+  stylist Stylist @relation(fields: [stylistId], references: [id], onDelete: Cascade)
+
+  @@index([stylistId, dayOfWeek])
+}
+
+/// Excepción puntual a una fecha concreta: vacaciones, día libre, o un
+/// horario especial que sobreescribe el WeeklyAvailability normal.
+model AvailabilityException {
+  id        String @id @default(cuid())
+  stylistId String
+
+  /// Fecha del día excepcional (sin componente de hora).
+  date DateTime @db.Date
+
+  /// Si es true, el estilista no trabaja ese día en absoluto.
+  isDayOff Boolean @default(true)
+
+  /// Si isDayOff es false, estas horas locales sobreescriben el horario
+  /// normal solo ese día.
+  startTime String?
+  endTime   String?
+  reason    String?
+
+  stylist Stylist @relation(fields: [stylistId], references: [id], onDelete: Cascade)
+
+  @@unique([stylistId, date])
+}
+
+/// Cliente sin cuenta/login. Se identifica y reutiliza por email para poder
+/// ver su historial de reservas aunque no exista autenticación.
+model Client {
+  id    String  @id @default(cuid())
+  name  String
+  email String  @unique
+  phone String?
+
+  bookings Booking[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+enum BookingStatus {
+  PENDING
+  CONFIRMED
+  CANCELLED
+  COMPLETED
+  NO_SHOW
+}
+
+model Booking {
+  id        String @id @default(cuid())
+  stylistId String
+  serviceId String
+  clientId  String
+
+  startAt DateTime @db.Timestamptz(3)
+  endAt   DateTime @db.Timestamptz(3)
+
+  status BookingStatus @default(PENDING)
+  notes  String?
+
+  stylist Stylist @relation(fields: [stylistId], references: [id])
+  service Service @relation(fields: [serviceId], references: [id])
+  client  Client  @relation(fields: [clientId], references: [id])
+
+  reminders ReminderLog[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // IMPORTANTE:
+  // Este índice ayuda a las consultas, pero NO impide por sí solo las
+  // dobles reservas por concurrencia. Para eso añadiremos a mano, en el
+  // archivo migration.sql generado por Prisma, un EXCLUDE CONSTRAINT de
+  // PostgreSQL (requiere la extensión btree_gist) sobre
+  // (stylistId, tsrange(startAt, endAt)) que la propia base de datos usa
+  // para rechazar solapamientos. Prisma todavía no soporta declarar este
+  // tipo de constraint directamente en el schema.prisma (ver
+  // github.com/prisma/prisma/issues/17514), así que no hay forma de
+  // expresarlo arriba: se edita el SQL de la migración a mano.
+  @@index([stylistId, startAt, endAt])
+}
+
+enum ReminderChannel {
+  EMAIL
+  WHATSAPP
+}
+
+enum ReminderStatus {
+  SCHEDULED
+  SENT
+  FAILED
+}
+
+/// Registro de cada recordatorio que el worker de Express debe enviar
+/// Una reserva puede tener varios ReminderLog (ej. 24h antes y
+/// 1h antes).
+model ReminderLog {
+  id           String          @id @default(cuid())
+  bookingId    String
+  channel      ReminderChannel
+  status       ReminderStatus  @default(SCHEDULED)
+  scheduledFor DateTime        @db.Timestamptz(3)
+  sentAt       DateTime?       @db.Timestamptz(3)
+  errorMessage String?
+
+  booking Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@index([status, scheduledFor])
+}
