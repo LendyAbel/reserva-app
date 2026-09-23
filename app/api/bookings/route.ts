@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { Prisma } from '@/generated/prisma/client';
 import { prisma } from '@/lib/prisma';
+import { VALID_STATUSES } from '@/lib/booking';
 
 interface DriverAdapterErrorMeta {
     driverAdapterError?: {
@@ -96,4 +97,92 @@ export const POST = async (request: Request) => {
             { status: 500 },
         );
     }
+};
+
+const MAX_PAGE_SIZE = 100;
+const DEFAULT_PAGE_SIZE = 20;
+
+export const GET = async (request: Request) => {
+    const { searchParams } = new URL(request.url);
+
+    const stylistId = searchParams.get('stylistId');
+    const clientName = searchParams.get('clientName');
+    const statusParam = searchParams.get('status');
+    const dateFrom = searchParams.get('dateFrom');
+    const dateTo = searchParams.get('dateTo');
+
+    if (
+        statusParam &&
+        !VALID_STATUSES.includes(statusParam as (typeof VALID_STATUSES)[number])
+    ) {
+        return NextResponse.json(
+            {
+                error: `status inválido. Valores permitidos: ${VALID_STATUSES.join(', ')}.`,
+            },
+            { status: 400 },
+        );
+    }
+
+    const page = Math.max(1, Number(searchParams.get('page')) || 1);
+    const pageSize = Math.min(
+        MAX_PAGE_SIZE,
+        Math.max(1, Number(searchParams.get('pageSize')) || DEFAULT_PAGE_SIZE),
+    );
+
+    const where: Prisma.BookingWhereInput = {};
+    if (stylistId) {
+        where.stylistId = stylistId;
+    }
+    if (statusParam) {
+        where.status = statusParam as Prisma.BookingWhereInput['status'];
+    }
+    if (clientName) {
+        where.client = { name: { contains: clientName, mode: 'insensitive' } };
+    }
+    if (dateFrom || dateTo) {
+        const parsedFrom = dateFrom ? new Date(dateFrom) : undefined;
+        const parsedTo = dateTo ? new Date(dateTo) : undefined;
+
+        if (
+            (parsedFrom && Number.isNaN(parsedFrom.getTime())) ||
+            (parsedTo && Number.isNaN(parsedTo.getTime()))
+        ) {
+            return NextResponse.json(
+                { error: 'dateFrom y dateTo deben ser fechas válidas.' },
+                { status: 400 },
+            );
+        }
+
+        where.startAt = {
+            ...(parsedFrom ? { gte: parsedFrom } : {}),
+            ...(parsedTo ? { lte: parsedTo } : {}),
+        };
+    }
+
+    const [bookings, totalCount] = await Promise.all([
+        prisma.booking.findMany({
+            where,
+            include: {
+                stylist: { select: { id: true, name: true } },
+                service: {
+                    select: { id: true, name: true, durationMinutes: true },
+                },
+                client: { select: { id: true, name: true, email: true } },
+            },
+            orderBy: { startAt: 'asc' },
+            skip: (page - 1) * pageSize,
+            take: pageSize,
+        }),
+        prisma.booking.count({ where }),
+    ]);
+
+    return NextResponse.json({
+        bookings,
+        pagination: {
+            page,
+            pageSize,
+            totalCount,
+            totalPages: Math.ceil(totalCount / pageSize),
+        },
+    });
 };
